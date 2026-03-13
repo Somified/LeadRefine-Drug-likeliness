@@ -1,3 +1,2 @@
 streamlit
-rdkit-pypi
 pillow
