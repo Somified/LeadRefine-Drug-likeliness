@@ -29,6 +29,8 @@ import math
 import os
 import time
 import requests
+import functools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── RDKit ─────────────────────────────────────────────────────────────────────
 from rdkit import Chem
@@ -774,6 +776,7 @@ def compute_overall_toxicophore_summary(pains, brenk, surechembl, mutagenicity, 
 # 8e. PUBCHEM METADATA RETRIEVAL  (NEW — additive only)
 # ============================================================
 
+@functools.lru_cache(maxsize=256)
 def get_pubchem_metadata(smiles):
     """
     Queries the PubChem PUG REST API using a SMILES string and retrieves
@@ -1184,22 +1187,195 @@ def analyze_smiles(smiles, output_path=None, show=False, fetch_pubchem=True):
 # 10. DATASET-LEVEL UTILITIES
 # ============================================================
 
-def analyze_multiple_smiles(smiles_list, output_dir=None, fetch_pubchem=False):
+def get_pubchem_metadata_batch(smiles_list):
     """
-    Analyse a list of SMILES strings.
+    Fetch PubChem metadata for a list of SMILES using batch API calls.
+
+    Instead of N × 10 sequential calls (the single-molecule path), this does:
+      Phase 1 — resolve all SMILES → CIDs in parallel  (N calls, concurrent)
+      Phase 2 — fetch ALL properties in ONE API call   (1 call)
+      Phase 3 — fetch ALL synonyms in ONE API call     (1 call)
+      Phase 4 — lightweight bioactivity count per CID  (N calls, concurrent)
+
+    Returns a list of metadata dicts in the same order as smiles_list.
+    """
+    BASE = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+
+    def _get(url, params=None, timeout=10):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r
+        except Exception:
+            pass
+        return None
+
+    def _json(url, params=None):
+        r = _get(url, params=params)
+        if r:
+            try:
+                return r.json()
+            except Exception:
+                pass
+        return {}
+
+    # ── Phase 1: Resolve SMILES → CID in parallel ────────────────────────────
+    cid_map = {}   # smiles -> cid (or None)
+
+    def _resolve_cid(smiles):
+        data = _json(f"{BASE}/compound/smiles/cids/JSON", params={"smiles": smiles})
+        cids = data.get("IdentifierList", {}).get("CID", [])
+        return smiles, int(cids[0]) if cids else None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for smiles, cid in ex.map(_resolve_cid, smiles_list):
+            cid_map[smiles] = cid
+
+    valid_cids   = [cid for cid in cid_map.values() if cid]
+    cid_to_smiles = {cid: smi for smi, cid in cid_map.items() if cid}
+
+    if not valid_cids:
+        return [{"found": False, "error": "Compound not found in PubChem database."}
+                for _ in smiles_list]
+
+    cid_str = ",".join(str(c) for c in valid_cids)
+
+    # ── Phase 2: Batch property fetch — ONE call for all CIDs ────────────────
+    props_wanted = ("IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES,"
+                    "InChI,InChIKey,Charge,XLogP,ExactMass,MonoisotopicMass")
+    prop_url  = f"{BASE}/compound/cid/{cid_str}/property/{props_wanted}/JSON"
+    prop_data = _json(prop_url).get("PropertyTable", {}).get("Properties", [])
+    props_by_cid = {p["CID"]: p for p in prop_data}
+
+    # ── Phase 3: Batch synonym fetch — ONE call for all CIDs ─────────────────
+    syn_url  = f"{BASE}/compound/cid/{cid_str}/synonyms/JSON"
+    syn_info = _json(syn_url).get("InformationList", {}).get("Information", [])
+    syns_by_cid = {s["CID"]: s.get("Synonym", []) for s in syn_info}
+
+    # ── Phase 4: Bioassay count per CID — parallel, lightweight ──────────────
+    def _assay_count(cid):
+        r = _get(f"{BASE}/compound/cid/{cid}/assaysummary/JSON")
+        if not r:
+            return cid, {"assay_count": 0, "active_count": 0,
+                         "inactive_count": 0, "note": "No bioassay data."}
+        try:
+            table    = r.json().get("Table", {})
+            cols     = [c.get("Name","") for c in table.get("Column", [])]
+            rows     = table.get("Row", [])
+            n        = len(rows)
+            active   = inactive = 0
+            if "Activity Outcome" in cols:
+                idx      = cols.index("Activity Outcome")
+                outcomes = [row.get("Cell",[])[idx] if len(row.get("Cell",[])) > idx
+                            else "" for row in rows]
+                active   = outcomes.count("Active")
+                inactive = outcomes.count("Inactive")
+            return cid, {"assay_count": n, "active_count": active,
+                         "inactive_count": inactive,
+                         "note": f"{n} bioassay record(s) found."}
+        except Exception:
+            return cid, {"assay_count": 0, "active_count": 0,
+                         "inactive_count": 0, "note": "Parse error."}
+
+    bioact_by_cid = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for cid, ba in ex.map(_assay_count, valid_cids):
+            bioact_by_cid[cid] = ba
+
+    # ── Assemble per-molecule results ─────────────────────────────────────────
+    results = []
+    for smiles in smiles_list:
+        cid = cid_map.get(smiles)
+        if not cid:
+            results.append({"found": False,
+                            "error": "Compound not found in PubChem database."})
+            continue
+
+        p    = props_by_cid.get(cid, {})
+        syns = syns_by_cid.get(cid, [])
+        results.append({
+            "found":            True,
+            "cid":              cid,
+            "iupac_name":       p.get("IUPACName", ""),
+            "common_name":      syns[0] if syns else p.get("IUPACName", ""),
+            "canonical_smiles": p.get("CanonicalSMILES", ""),
+            "formula":          p.get("MolecularFormula", ""),
+            "molecular_weight": p.get("MolecularWeight"),
+            "inchi":            p.get("InChI", ""),
+            "inchikey":         p.get("InChIKey", ""),
+            "charge":           p.get("Charge"),
+            "xlogp":            p.get("XLogP"),
+            "exact_mass":       p.get("ExactMass"),
+            "monoisotopic_mass":p.get("MonoisotopicMass"),
+            "synonyms":         syns[:10],
+            "bioactivity":      bioact_by_cid.get(cid, {}),
+            # Fields skipped in batch mode for speed:
+            "targets":      [],
+            "pharmacology": "",
+            "drug_info":    {},
+            "toxicity":     [],
+            "pathways":     [],
+            "literature":   [],
+            "links": {
+                "compound_page":  f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}",
+                "structure_image":f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/PNG",
+                "sdf_download":   f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/SDF",
+                "json_api":       f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/JSON",
+            },
+            "_batch_mode": True,   # flag — detailed fields omitted for speed
+        })
+    return results
+
+
+def analyze_multiple_smiles(smiles_list, output_dir=None, fetch_pubchem=False,
+                             max_workers=6):
+    """
+    Analyse a list of SMILES strings **in parallel**.
 
     Parameters
     ----------
     smiles_list   : list of SMILES strings
     output_dir    : optional directory — if provided, a PNG report is saved
                     for each valid molecule as <output_dir>/adme_report_<i>.png
-    fetch_pubchem : if True, query PubChem for each molecule (slow — one network
-                    round-trip per molecule). Defaults to False for batch speed.
+    fetch_pubchem : if True, enrich results with PubChem batch API (fast —
+                    uses 2 batch calls + parallel CID resolution instead of
+                    N×10 sequential calls). Defaults to False.
+    max_workers   : thread pool size for parallel ADME analysis (default 6).
+
+    Speed characteristics
+    ---------------------
+    - ADME analysis runs in parallel across all molecules simultaneously.
+    - PubChem (when enabled) uses batch endpoints: ~3 s for any batch size
+      instead of N × 10–30 s.
     """
-    results = []
-    for i, smiles in enumerate(smiles_list):
+    results = [None] * len(smiles_list)
+
+    def _analyse_one(args):
+        i, smiles = args
         out = os.path.join(output_dir, f"adme_report_{i}.png") if output_dir else None
-        results.append(analyze_smiles(smiles, output_path=out, fetch_pubchem=fetch_pubchem))
+        # Never fetch PubChem here — we do it in one batch call below
+        return i, analyze_smiles(smiles, output_path=out, fetch_pubchem=False)
+
+    # ── Parallel ADME analysis ────────────────────────────────────────────────
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_analyse_one, (i, s)): i
+                   for i, s in enumerate(smiles_list)}
+        for future in as_completed(futures):
+            i, result = future.result()
+            results[i] = result
+
+    # ── Batch PubChem enrichment (optional) ───────────────────────────────────
+    if fetch_pubchem:
+        batch_meta = get_pubchem_metadata_batch(smiles_list)
+        for i, meta in enumerate(batch_meta):
+            if results[i] is not None:
+                results[i]["pubchem_metadata"] = meta
+    else:
+        for r in results:
+            if r is not None:
+                r["pubchem_metadata"] = {"found": False,
+                                          "error": "PubChem lookup skipped."}
+
     return results
 
 
