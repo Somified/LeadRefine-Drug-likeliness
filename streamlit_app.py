@@ -537,6 +537,135 @@ def render_literature_intelligence(pubchem_metadata: dict, key_prefix: str = "")
             _lit_paper_card(p, ac)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SCOPE BANNER + OUT-OF-SCOPE VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_scope_banner() -> None:
+    """
+    Displays a concise scope notice before the SMILES input.
+    Tells users exactly what molecule types this tool is and isn't designed for.
+    Does NOT block input — purely informational.
+    """
+    st.markdown("""
+<div style="background:#161B22;border:1px solid #30363D;border-left:4px solid #58A6FF;
+border-radius:6px;padding:12px 16px;margin-bottom:12px;">
+<div style="font-size:0.88rem;font-weight:700;color:#58A6FF;margin-bottom:6px;">
+🎯 Designed for drug-like organic small molecules</div>
+<div style="font-size:0.82rem;color:#8B949E;line-height:1.7;">
+<b style="color:#C9D1D9;">Works well with:</b> oral drug candidates, investigational compounds,
+natural product derivatives, synthetic intermediates with MW 150–800 Da.<br>
+<b style="color:#C9D1D9;">Limited accuracy for:</b> heavy metals, inorganic salts, simple
+industrial solvents, polymers, biologics, or any molecule with fewer than 5 heavy atoms.<br>
+<b style="color:#C9D1D9;">All outputs are rule-based structural predictions</b> —
+not a substitute for experimental ADME data.
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+def _out_of_scope_warning(result: dict) -> None:
+    """
+    Checks the analysed molecule against out-of-scope criteria and renders
+    a contextual warning if any are triggered.
+    Does NOT block or hide results — the analysis is still shown in full.
+
+    Out-of-scope triggers
+    ---------------------
+    - Heavy metal atoms present (Pb, Hg, As, Cd, Fe, Cu, Zn, Ni, Co, Cr, Mn, Se, Tl)
+    - Molecular weight < 150 Da  (too small — simple solvent / reagent territory)
+    - Molecular weight > 900 Da  (too large — outside oral small-molecule space)
+    - Zero carbon atoms          (inorganic compound)
+    - Fewer than 5 heavy atoms   (trivially simple — no meaningful ADME)
+    - Zero rings AND MW < 200    (acyclic, very small — likely industrial chemical)
+    """
+    from rdkit import Chem
+    from rdkit.Chem import rdMolDescriptors, Descriptors
+
+    mol = result.get("mol")
+    if mol is None:
+        return
+
+    props    = result.get("properties", {})
+    mw       = props.get("molecular_weight", 0)
+    warnings = []
+
+    # ── Check 1: heavy metals ────────────────────────────────────────────────
+    HEAVY_METALS = {82, 80, 33, 48, 26, 29, 30, 28, 27, 24, 25, 34, 81}  # atomic nums
+    metal_symbols = []
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() in HEAVY_METALS:
+            metal_symbols.append(atom.GetSymbol())
+    if metal_symbols:
+        unique = list(dict.fromkeys(metal_symbols))
+        warnings.append(
+            f"**Heavy metal atom(s) detected ({', '.join(unique)})** — "
+            "ADME models are designed for organic molecules. CYP, hERG, PPB and "
+            "microsomal stability outputs are not meaningful for metal-containing compounds."
+        )
+
+    # ── Check 2: MW too small ────────────────────────────────────────────────
+    if mw < 150:
+        warnings.append(
+            f"**Molecular weight is very low ({mw:.0f} Da)** — "
+            "molecules below 150 Da are typically solvents, reagents or fragments, "
+            "not drug candidates. Lipinski and permeability scores are unreliable at this size."
+        )
+
+    # ── Check 3: MW too large ────────────────────────────────────────────────
+    if mw > 900:
+        warnings.append(
+            f"**Molecular weight is very high ({mw:.0f} Da)** — "
+            "oral small-molecule drug space is typically 150–600 Da. "
+            "Above 900 Da, Lipinski rules and Caco-2 predictions lose validity."
+        )
+
+    # ── Check 4: no carbon atoms (inorganic) ─────────────────────────────────
+    carbon_count = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6)
+    if carbon_count == 0:
+        warnings.append(
+            "**No carbon atoms detected** — this appears to be an inorganic compound. "
+            "All ADME modules assume organic chemistry. Results are not meaningful."
+        )
+
+    # ── Check 5: too few heavy atoms ─────────────────────────────────────────
+    heavy_atom_count = mol.GetNumHeavyAtoms()
+    if heavy_atom_count < 5:
+        warnings.append(
+            f"**Very few heavy atoms ({heavy_atom_count})** — "
+            "this molecule is too simple to produce meaningful drug-likeness predictions."
+        )
+
+    # ── Check 6: acyclic + very small ────────────────────────────────────────
+    ring_count = rdMolDescriptors.CalcNumRings(mol)
+    if ring_count == 0 and mw < 200:
+        warnings.append(
+            "**No ring systems and low molecular weight** — "
+            "this looks like a simple acyclic compound (solvent, reagent or industrial chemical). "
+            "ADME predictions are designed for more complex drug-like scaffolds."
+        )
+
+    if not warnings:
+        return
+
+    # ── Render ───────────────────────────────────────────────────────────────
+    st.markdown("""
+<div style="background:#1C1208;border:1px solid #D29922;border-left:4px solid #D29922;
+border-radius:6px;padding:12px 16px;margin:12px 0;">
+<div style="font-size:0.88rem;font-weight:700;color:#D29922;margin-bottom:6px;">
+⚠️ Out-of-scope molecule detected — results should be interpreted with caution</div>
+""" + "".join(
+        f'<div style="font-size:0.82rem;color:#C9D1D9;margin-bottom:4px;">▸ {w}</div>'
+        for w in warnings
+    ) + """
+<div style="font-size:0.79rem;color:#8B949E;margin-top:8px;">
+The full analysis is still shown below — but the values above are not pharmacologically
+meaningful for this molecule type. LeadRefine is designed for drug-like organic
+small molecules (MW 150–900 Da, carbon-containing, structurally complex).
+</div></div>
+""", unsafe_allow_html=True)
+
+
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -584,6 +713,7 @@ render_glossary()
 # ══════════════════════════════════════════════════════════════════
 if mode == "Single molecule":
 
+    _render_scope_banner()
     default_smiles = demos[selected_demo] if selected_demo != "— select —" else ""
     smiles_input = st.text_input(
         "SMILES string",
@@ -608,6 +738,9 @@ if mode == "Single molecule":
     # ── Render results ───────────────────────────────────────────────────────
     result = st.session_state.get("single_result")
     if result and result.get("valid"):
+
+        # Out-of-scope check (shown before anything else)
+        _out_of_scope_warning(result)
 
         # KPI
         st.markdown("---")
@@ -644,6 +777,7 @@ if mode == "Single molecule":
 # BATCH MODE
 # ══════════════════════════════════════════════════════════════════
 else:
+    _render_scope_banner()
     st.markdown("Enter one SMILES per line:")
     batch_input = st.text_area(
         "SMILES list", height=180,
@@ -722,6 +856,7 @@ else:
             label += f":  `{r['smiles'][:50]}`"
 
             with st.expander(label, expanded=False):
+                _out_of_scope_warning(r)
                 d_icon = "🟢" if r["decision"]=="ACCEPT" else "🔴"
                 sc1, sc2, sc3, sc4 = st.columns(4)
                 sc1.metric("Score",     f"{r['score']} / 100")
